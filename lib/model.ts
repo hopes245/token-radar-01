@@ -1,4 +1,4 @@
-// The radar's scoring model, version radar-2.
+// The radar's scoring model, version radar-3.
 //
 // One snapshot in, one ranked board out. Every row is scored by the same function of the
 // snapshot's own figures; no protocol name is ever special-cased.
@@ -6,10 +6,16 @@
 // Implied value:
 //
 //   multiple   = category multiple, from live-token comparables (below)
-//   growth     = clamp(change_7d, -60, 120); growthMult = 1 + growth/100 * 0.5
+//   growth     = clamp(change_7d, -60, 120)
+//   growthMult = 1 + growth/100 * 0.5 when growth is up, 1 + growth/100 * 0.75 when down
+//                (a shrinking protocol's launch value decays faster than a growing one's rises)
+//   relGrowth  = clamp((growth - category median growth) / 50, -0.4, 0.4)
+//   relMult    = 1 + relGrowth * 0.3
+//                (a protocol outgrowing its own category is hotter than one riding its
+//                category's wave; the median is the category's own, from the snapshot)
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 * 0.4   (unknown age: 365 days)
 //   spread     = 1 + 0.03 * min(chains - 1, 10)           (how widely deployed)
-//   implied    = max(1, round(tvl_usd * multiple * growthMult * maturity * spread))
+//   implied    = max(1, round(tvl_usd * multiple * growthMult * relMult * maturity * spread))
 //
 // The category multiple is the model's one idea: a pre-token protocol is worth what the
 // market already pays for each dollar of TVL in its own category. For every category, take
@@ -63,6 +69,10 @@ export interface Snapshot {
 /** Every constant the model uses, shipped to the dashboard so the page recomputes identically. */
 export interface ModelConstants {
   growth_weight: number;
+  growth_weight_down: number;
+  growth_rel_weight: number;
+  growth_rel_cap: number;
+  growth_rel_scale: number;
   growth_floor: number;
   growth_cap: number;
   maturity_floor: number;
@@ -81,6 +91,10 @@ export interface ModelConstants {
 
 export const MODEL: ModelConstants = {
   growth_weight: 0.5,
+  growth_weight_down: 0.75,
+  growth_rel_weight: 0.3,
+  growth_rel_cap: 0.4,
+  growth_rel_scale: 50,
   growth_floor: -60,
   growth_cap: 120,
   maturity_floor: 0.6,
@@ -97,7 +111,7 @@ export const MODEL: ModelConstants = {
   spread_max_chains: 10,
 };
 
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** Cap on early rows below the watchlist floor; the board holds watchlist + early rows. */
 export const EARLY_ROWS = 160;
@@ -113,6 +127,13 @@ export interface CategoryMultiple {
   multiple: number;
 }
 
+/** One category's median seven-day growth, from every protocol in it that reports one. */
+export interface CategoryGrowth {
+  category: string;
+  median: number;
+  reporters: number;
+}
+
 /** A farm step before it is flattened to the board's one string per step. */
 export interface FarmStep {
   text: string;
@@ -126,8 +147,11 @@ export interface ModelBreakdown {
   category_comparables: number;
   category_median: number;
   global_median: number;
+  category_growth_median: number | null;
+  growth_vs_category: number;
   growth_pct: number;
   growth_multiplier: number;
+  growth_relative_multiplier: number;
   maturity_multiplier: number;
   diversification_multiplier: number;
   age_days: number | null;
@@ -167,8 +191,11 @@ export interface RadarRow {
   implied_value_usd: number;
   category_multiple: number;
   category_comparables: number;
+  category_growth_median: number | null;
+  growth_vs_category: number;
   on_watchlist: boolean;
   growth_multiplier: number;
+  growth_relative_multiplier: number;
   maturity_multiplier: number;
   diversification_multiplier: number;
 }
@@ -198,6 +225,8 @@ export interface RadarData {
   live_size: number;
   global_median: number;
   multiples: CategoryMultiple[];
+  growth_medians: CategoryGrowth[];
+  category_tvl_medians: CategoryGrowth[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -272,6 +301,50 @@ export function comparables(snapshot: Snapshot, model: ModelConstants): { global
   return { globalMedian, multiples };
 }
 
+/**
+ * Per-category medians from every protocol in the category: seven-day growth (only
+ * protocols that report one) and TVL. The growth median is the baseline the model's
+ * category-relative factor measures a protocol against; the TVL median is the context
+ * the detail view shows next to the protocol's own TVL.
+ */
+export function categoryMedians(snapshot: Snapshot): { growth: CategoryGrowth[]; tvl: CategoryGrowth[] } {
+  const growthBy = new Map<string, number[]>();
+  const tvlBy = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    const cat = p.category ?? 'Other';
+    if (typeof p.change_7d === 'number' && Number.isFinite(p.change_7d)) {
+      const list = growthBy.get(cat) ?? [];
+      list.push(p.change_7d);
+      growthBy.set(cat, list);
+    }
+    if (p.tvl_usd > 0) {
+      const list = tvlBy.get(cat) ?? [];
+      list.push(p.tvl_usd);
+      tvlBy.set(cat, list);
+    }
+  }
+  const byName = (a: CategoryGrowth, b: CategoryGrowth): number => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0);
+  const growth = [...growthBy.entries()]
+    .map(([category, values]) => ({ category, median: median(values), reporters: values.length }))
+    .sort(byName);
+  const tvl = [...tvlBy.entries()]
+    .map(([category, values]) => ({ category, median: median(values), reporters: values.length }))
+    .sort(byName);
+  return { growth, tvl };
+}
+
+/** A category's median seven-day growth, or null when no protocol in it reports one. */
+export function growthMedianFor(category: string | null, growthMedians: CategoryGrowth[]): number | null {
+  const found = growthMedians.find((g) => g.category === (category ?? 'Other'));
+  return found === undefined ? null : found.median;
+}
+
+/** A category's median TVL, or null when the category holds no protocol with a TVL. */
+export function tvlMedianFor(category: string | null, tvlMedians: CategoryGrowth[]): number | null {
+  const found = tvlMedians.find((g) => g.category === (category ?? 'Other'));
+  return found === undefined ? null : found.median;
+}
+
 /** The multiple one category scores with: its shrunk median, or the clamped global median. */
 export function multipleFor(category: string | null, multiples: CategoryMultiple[], globalMedian: number, model: ModelConstants): { multiple: number; comparables: number; median: number } {
   const found = multiples.find((m) => m.category === (category ?? 'Other'));
@@ -289,16 +362,22 @@ export function scoreProtocol(
   asOf: string,
   multiples: CategoryMultiple[],
   globalMedian: number,
+  growthMedians: CategoryGrowth[],
   model: ModelConstants,
 ): { implied: number; breakdown: ModelBreakdown } {
   const age = ageDays(asOf, protocol.listed_at);
   const { multiple, comparables, median: catMedian } = multipleFor(protocol.category, multiples, globalMedian, model);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(protocol.change_7d, 0)));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const weight = growthPct >= 0 ? model.growth_weight : model.growth_weight_down;
+  const growthMult = 1 + (growthPct / 100) * weight;
+  const catGrowth = growthMedianFor(protocol.category, growthMedians);
+  const vsCategory = catGrowth === null ? 0 : growthPct - catGrowth;
+  const relClamped = Math.min(model.growth_rel_cap, Math.max(-model.growth_rel_cap, vsCategory / model.growth_rel_scale));
+  const relMult = 1 + relClamped * model.growth_rel_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const spreadMult = 1 + model.spread_per_chain * Math.min(Math.max(protocol.chains.length - 1, 0), model.spread_max_chains);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * spreadMult));
+  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * relMult * maturityMult * spreadMult));
   return {
     implied,
     breakdown: {
@@ -306,8 +385,11 @@ export function scoreProtocol(
       category_comparables: comparables,
       category_median: catMedian,
       global_median: globalMedian,
+      category_growth_median: catGrowth,
+      growth_vs_category: vsCategory,
       growth_pct: growthPct,
       growth_multiplier: growthMult,
+      growth_relative_multiplier: relMult,
       maturity_multiplier: maturityMult,
       diversification_multiplier: spreadMult,
       age_days: age,
@@ -334,6 +416,7 @@ export function isEarlyCandidate(p: SnapshotProtocol): boolean {
 /** The ranked board: every watchlist slug, plus the strongest early candidates by implied value. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const { globalMedian, multiples } = comparables(snapshot, model);
+  const { growth: growthMedians } = categoryMedians(snapshot);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
@@ -342,13 +425,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && isEarlyCandidate(p) && p.tvl_usd < snapshot.floor_usd)
-    .map((p) => ({ p, score: scoreProtocol(p, snapshot.as_of, multiples, globalMedian, model) }))
+    .map((p) => ({ p, score: scoreProtocol(p, snapshot.as_of, multiples, globalMedian, growthMedians, model) }))
     .sort((a, b) => b.score.implied - a.score.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const { p } of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const score = scoreProtocol(p, snapshot.as_of, multiples, globalMedian, model);
+    const score = scoreProtocol(p, snapshot.as_of, multiples, globalMedian, growthMedians, model);
     return { p, score };
   });
   scored.sort((a, b) => b.score.implied - a.score.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -403,6 +486,11 @@ const PLAYBOOKS: Playbook[] = [
     second: 'Borrow a small amount against the supplied collateral and repay it within the week, so both sides of the market show activity.',
   },
   {
+    keys: ['index'],
+    main: "Buy $${capital} of ${name}'s index token on ${chain} and hold it.",
+    second: "Check the index's rebalance once and add a small amount after it, keeping the position whole.",
+  },
+  {
     keys: ['dex'],
     main: "Provide $${capital} of liquidity to ${name}'s deepest pool on ${chain} and keep the position open.",
     second: 'Route one swap through ${name} on ${chain} each week, keeping the receipt in the same wallet.',
@@ -413,7 +501,7 @@ const PLAYBOOKS: Playbook[] = [
     second: "Claim and re-deposit the vault's yield once, so the position compounds instead of sitting idle.",
   },
   {
-    keys: ['deriv', 'perpetual', 'option', 'interest rate'],
+    keys: ['deriv', 'perpetual', 'option', 'interest rate', 'synthetic'],
     main: 'Deposit $${capital} of USDC as margin on ${name} and open one small hedged position.',
     second: 'Close and reopen the hedge once a week at a different size, keeping total exposure under $${capital}.',
   },
@@ -458,9 +546,64 @@ const PLAYBOOKS: Playbook[] = [
     second: "Stake a small amount of the chain's native asset through ${name} and keep it staked.",
   },
   {
-    keys: ['index'],
-    main: "Buy $${capital} of ${name}'s index token on ${chain} and hold it.",
-    second: "Check the index's rebalance once and add a small amount after it, keeping the position whole.",
+    keys: ['basis'],
+    main: "Deposit $${capital} of USDC into ${name}'s basis vault on ${chain} and keep the position open through one funding cycle.",
+    second: 'Check the funding rate once a week and keep the position while the basis stays positive.',
+  },
+  {
+    keys: ['anchor btc', 'decentralized btc'],
+    main: 'Deposit $${capital} of BTC into ${name} on ${chain} and hold the receipt token.',
+    second: 'Check the backing and redemption route once, then keep the position through the full hold.',
+  },
+  {
+    keys: ['payment'],
+    main: 'Spend $${capital} through ${name} on ${chain} for a real payment and keep the receipt in the farming wallet.',
+    second: 'Make a second, smaller payment the following week so the wallet shows repeat use.',
+  },
+  {
+    keys: ['liquidity manager'],
+    main: "Deposit $${capital} of USDC into a ${name} managed position on ${chain} and keep the shares.",
+    second: "Check the manager's rebalance once and leave the position in place through it.",
+  },
+  {
+    keys: ['otc'],
+    main: 'Complete one $${capital} trade through ${name} on ${chain} and keep the settlement receipt.',
+    second: 'Make a second, smaller trade the following week from the same wallet.',
+  },
+  {
+    keys: ['privacy'],
+    main: 'Use $${capital} through ${name} on ${chain} for one private transaction and keep the receipt.',
+    second: 'Repeat the same action once the following week from the same wallet.',
+  },
+  {
+    keys: ['governance'],
+    main: 'Deposit $${capital} into ${name} on ${chain} and vote once on an open proposal.',
+    second: 'Vote on a second proposal the following week and keep the position through the hold.',
+  },
+  {
+    keys: ['card issuer', 'crypto card'],
+    main: 'Order and fund a $${capital} card through ${name} and make one real purchase with it.',
+    second: 'Make a second purchase the following week and keep the card funded through the hold.',
+  },
+  {
+    keys: ['cedefi'],
+    main: 'Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.',
+    second: 'Check the yield report once and keep the deposit through one full reporting cycle.',
+  },
+  {
+    keys: ['nft'],
+    main: 'Buy one ${name} listing worth about $${capital} on ${chain} and hold it in the farming wallet.',
+    second: 'List or trade once more the following week so the wallet shows repeat activity.',
+  },
+  {
+    keys: ['launchpad'],
+    main: 'Stake $${capital} through ${name} on ${chain} to qualify for its next launch and keep the stake.',
+    second: 'Join one launch allocation and hold the allocation through the full hold.',
+  },
+  {
+    keys: ['ai agents', 'decentralized ai'],
+    main: 'Pay $${capital} for one agent run through ${name} on ${chain} and keep the receipt.',
+    second: 'Run a second, different agent task the following week from the same wallet.',
   },
 ];
 
@@ -516,7 +659,7 @@ const CLOSING: string[] = [
 ];
 
 /**
- * A protocol's six-step farm plan, derived from its own record: category, first chain, TVL
+ * A protocol's eight-step farm plan, derived from its own record: category, first chain, TVL
  * tier and age. Two steps vary their phrasing by a hash of the slug, so neighbouring rows do
  * not read as copies. Every step carries what it costs and how long it takes.
  */
@@ -534,6 +677,11 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '5 minutes',
     },
     {
+      text: `Move $${capital} of USDC plus gas to ${chain} and confirm it lands in the farming wallet.`,
+      cost: `about $${gas.setup} of gas to move the funds`,
+      time: '10 minutes',
+    },
+    {
       text: fill(book.main, p.name, capital, chain),
       cost: `$${capital} of capital and about $${gas.setup} of gas`,
       time: '15 minutes to set up',
@@ -547,6 +695,11 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: CADENCE[variant]!,
       cost: `about $${gas.weekly} of gas a week`,
       time: '10 minutes a week',
+    },
+    {
+      text: `Check ${p.name}'s own points or rewards page once a month and note any new quest or snapshot date.`,
+      cost: 'nothing; the page is free to read',
+      time: '5 minutes a month',
     },
     {
       text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
@@ -604,8 +757,11 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
     category_comparables: row.model.category_comparables,
+    category_growth_median: row.model.category_growth_median,
+    growth_vs_category: row.model.growth_vs_category,
     on_watchlist: onWatchlist,
     growth_multiplier: row.model.growth_multiplier,
+    growth_relative_multiplier: row.model.growth_relative_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     diversification_multiplier: row.model.diversification_multiplier,
   };
@@ -616,6 +772,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const { globalMedian, multiples } = comparables(snapshot, model);
+  const { growth: growthMedians, tvl: tvlMedians } = categoryMedians(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -629,6 +786,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     global_median: globalMedian,
     multiples,
+    growth_medians: growthMedians,
+    category_tvl_medians: tvlMedians,
     rows: board.map((r) => radarRow(r, snapshot.watchlist.includes(r.slug))),
     live,
   };
