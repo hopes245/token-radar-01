@@ -1,4 +1,4 @@
-// Token Radar, model radar-2: the entrypoint.
+// Token Radar, model radar-4: the entrypoint.
 //
 // Reads the sealed snapshot, scores the ranked board with lib/model.ts, and writes the
 // grader's /output: board.json, data.js (the dashboard's dataset), the dashboard/ page,
